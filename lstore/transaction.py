@@ -245,11 +245,12 @@ class Transaction:
             except Exception:
                 pass
 
-            # Mark the tail record we created as deleted
+            # Remove the tail record we created so abort gets closer to the exact initial state
             if new_tail != 0:
                 try:
                     with self._meta_guard():
-                        t._deleted[int(new_tail)] = True
+                        t._deleted.pop(int(new_tail), None)
+                        t.page_directory.pop(int(new_tail), None)
                 except Exception:
                     pass
 
