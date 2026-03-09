@@ -189,17 +189,18 @@ class Transaction:
                     if old_deleted:
                         t._latest_cache.pop(base_rid, None)
                     elif old_row is not None:
-                        t._latest_cache[base_rid] = [int(v) for v in old_row]
                         pk = int(old_row[t.key])
                         t.key2rid[pk] = int(base_rid)
+                        t._latest_cache[base_rid] = [int(v) for v in old_row]
             except Exception:
                 pass
 
-            if old_row is not None and old_deleted is False:
+            if old_row is not None and not old_deleted:
                 for c in range(t.num_columns):
                     if t.index.is_indexed(c):
+                        val = int(old_row[c])
                         try:
-                            t.index.insert_entry(int(c), int(old_row[c]), int(base_rid))
+                            t.index.insert_entry(int(c), val, int(base_rid))
                         except Exception:
                             pass
             return
