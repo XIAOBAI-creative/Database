@@ -164,15 +164,24 @@ class Transaction:
             base_rid = int(undo.base_rid)
             pk = int(undo.payload["pk"])
             indexed = list(undo.payload.get("indexed", []))
-
+        
             try:
                 with self._meta_guard():
                     t._deleted[base_rid] = True
                     t._latest_cache.pop(base_rid, None)
+        
                     if t.key2rid.get(pk) == base_rid:
                         t.key2rid.pop(pk, None)
+        
+                    t.page_directory.pop(base_rid, None)
+        
+                    try:
+                        t._base_rid_list.remove(base_rid)
+                    except ValueError:
+                        pass
             except Exception:
                 pass
+        
             for (c, v) in indexed:
                 try:
                     t.index.delete_entry(int(c), int(v), int(base_rid))
