@@ -388,6 +388,16 @@ class Table:
         with self._meta_lock:
             return list(self._base_rid_list)
 
+    def get_base_rid_by_key(self, pk: int) -> Optional[int]:
+        with self._meta_lock:
+            base_rid = self.key2rid.get(int(pk))
+            if base_rid is None:
+                return None
+            base_rid = int(base_rid)
+            if bool(self._deleted.get(base_rid, False)):
+                return None
+            return base_rid
+
     def _read_physical_column(self, rid: int, col: int) -> int:
         with self._meta_lock:
             loc = self.page_directory.get(int(rid))
@@ -405,6 +415,9 @@ class Table:
 
     def _base_schema(self, base_rid: int) -> int:
         return int(self._read_physical_column(base_rid, SCHEMA_ENCODING_COLUMN))
+
+    def read_base_user_value(self, base_rid: int, user_col: int) -> int:
+        return int(self._read_physical_column(int(base_rid), HIDDEN_COLS + int(user_col)))
 
     def _base_page_range_id(self, base_rid: int) -> int:
         with self._meta_lock:
@@ -504,8 +517,7 @@ class Table:
 
     def read_relative_user_value(self, base_rid: int, user_col: int, relative_version: int) -> int:
         return int(self.read_relative_user_columns(base_rid, relative_version)[int(user_col)])
-
-    # -------------------------
+        # -------------------------
     # Update apply
     # -------------------------
     def apply_update(self, base_rid: int, new_user_cols: List[Optional[int]], prev_latest: Optional[List[int]] = None) -> int:
@@ -674,8 +686,6 @@ class Table:
             if checker(rid_res):
                 return True
             if pk_res is not None and checker(pk_res):
-                return True
-            if checker(("TABLE_ALL", self.name)):
                 return True
             return False
         except Exception:
@@ -874,8 +884,7 @@ class Table:
             ready_ids = list(self._merge_results.keys())
         for pr_id in ready_ids:
             self.apply_merge_if_ready(int(pr_id))
-
-    # -------------------------
+        # -------------------------
     # Persistence
     # -------------------------
     def to_metadata(self) -> dict:
