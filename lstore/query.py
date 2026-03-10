@@ -23,12 +23,12 @@ class Query:
             txn_id = getattr(txn, "txn_id", None)
             if txn_id is None:
                 return True
-
+    
             lm = getattr(self.table, "lock_manager", None)
             if lm is None:
                 return True
-
-            lm.acquire_S(int(txn_id), int(rid))
+    
+            lm.acquire_S(int(txn_id), ("RID", self.table.name, int(rid)))
             return True
         except LockConflict:
             return False
