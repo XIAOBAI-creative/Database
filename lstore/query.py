@@ -104,21 +104,30 @@ class Query:
             search_col = int(column)
             search_val = int(key)
 
-            # find matching base rids
-            if self.table.index.is_indexed(search_col):
-                # index exists, nice and fast
+
+            # If running inside a transaction and the search column is NOT the primary key,
+            # we avoid using the secondary index to prevent reading uncommitted updates.
+            use_index = (
+                txn is None and
+                self.table.index.is_indexed(search_col)
+            )
+            
+            if use_index:
                 rids = self.table.index.locate(search_col, search_val)
             else:
-                # no index, gotta do a full scan
                 rids = []
                 for rid in self.table.all_base_rids():
                     rid = int(rid)
+            
                     if self.table.is_deleted_rid(rid):
                         continue
-                    # need to lock before reading during scan
+            
+                    # acquire S lock when in a transaction
                     if not self._acquire_shared_if_needed(txn, rid):
                         return False
+            
                     v = self.table.read_latest_user_value(rid, search_col)
+            
                     if int(v) == search_val:
                         rids.append(rid)
 
@@ -201,7 +210,12 @@ class Query:
             record_found = False
 
             # if there's an index on the key column, use range lookup -- way faster
-            if self.table.index.is_indexed(self._key_col):
+            use_index = (
+                txn is None and
+                self.table.index.is_indexed(self._key_col)
+            )
+            
+            if use_index:
                 rids = self.table.index.locate_range(start_k, end_k, self._key_col)
                 for rid in rids:
                     rid = int(rid)
