@@ -6,8 +6,6 @@ import threading
 from lstore.page import Page
 from lstore.bufferpool import BufferPool
 
-# from contextlib import nullcontext
-
 INDIRECTION_COLUMN = 0
 RID_COLUMN = 1
 TIMESTAMP_COLUMN = 2
@@ -83,10 +81,8 @@ class PageRange:
         return pages[page_id]
 
     def _pid(self, is_tail: bool, col: int, page_id: int):
-        # tail pid: (table, pr, True, col, pid)
         if bool(is_tail):
             return (self.table_name, self.page_range_id, True, int(col), int(page_id))
-        # base pid: (table, pr, False, base_ver, col, pid)
         return (self.table_name, self.page_range_id, False, int(self.base_version), int(col), int(page_id))
 
     def get_page(self, is_tail: bool, col: int, page_id: int) -> Page:
@@ -118,7 +114,6 @@ class PageRange:
                 self.buffer_pool.unpin_page(self._pid(is_tail, col, page_id), is_dirty=bool(dirty))
 
     def get_pages_batch(self, is_tail: bool, page_id: int, num_cols: int) -> list:
-        """Fetch all column pages for a given (is_tail, page_id) in one lock acquisition."""
         with self._lock:
             for col in range(num_cols):
                 if is_tail:
@@ -136,7 +131,6 @@ class PageRange:
             return self.buffer_pool.fetch_many(pids)
 
     def release_pages_batch(self, is_tail: bool, page_id: int, num_cols: int, dirty: bool):
-        """Release all column pages for a given (is_tail, page_id) in one lock acquisition."""
         with self._lock:
             if self.buffer_pool is None:
                 return
@@ -145,14 +139,12 @@ class PageRange:
 
     def alloc_base_slot(self) -> Tuple[int, int]:
         with self._lock:
-            # 鍏抽敭锛氫笉瑕佺敤 Page.num_records / has_capacity 鍒ゆ柇婊￠〉锛坮eopen 鏃朵細鏄?0锛?
             if self._next_base_offset >= Page.CAPACITY:
                 self._next_base_page_id += 1
                 self._next_base_offset = 0
 
             page_id = self._next_base_page_id
             offset = self._next_base_offset
-            # 纭繚缁撴瀯瀛樺湪锛堜笉鍙備笌 capacity 鍒ゆ柇锛?
             self._ensure_base_page(0, page_id)
 
             self._next_base_offset += 1
@@ -172,11 +164,7 @@ class PageRange:
             return (page_id, offset)
 
 
-class Table: 
-    """
-    鐩爣锛歝ontention-free merge锛堟敼 Table锛屼笉鏀?PageRange锛?      - 鍓嶅彴锛氫粛璧?bufferpool(fetch/unpin)锛屾甯歌鍐?      - 鍚庡彴 merge worker锛氬彧璇荤鐩?raw bytes -> Page.from_bytes锛屼笉 pin/unpin锛屼笉鎶?_bp_lock
-      - apply_merge_if_ready锛氶〉绾х煭閿?+ 鍙戝竷鐭攣锛堝彂甯?new base_version + TPS锛?    """
-
+class Table:
     MERGE_TRIGGER_EVERY_N_TAIL_PAGES = 10
 
     def __init__(self, name: str, num_columns: int, key: int, buffer_pool: Optional[BufferPool] = None):
@@ -247,7 +235,7 @@ class Table:
             return len(self.page_ranges) - 1
 
     # -------------------------
-    # Delete helpers 
+    # Delete helpers
     # -------------------------
     def is_deleted_rid(self, base_rid: int) -> bool:
         with self._meta_lock:
@@ -281,7 +269,6 @@ class Table:
             for i, v in enumerate(user_columns):
                 full[HIDDEN_COLS + i] = int(v)
 
-            # Batch: fetch all column pages in one BP lock
             pages = pr.get_pages_batch(False, page_id, self.num_columns_total)
             for col in range(self.num_columns_total):
                 off = pages[col].write(full[col])
@@ -328,7 +315,6 @@ class Table:
             for i, v in enumerate(user_columns):
                 full[HIDDEN_COLS + i] = 0 if v is None else int(v)
 
-            # Batch: fetch all column pages in one BP lock
             pages = pr.get_pages_batch(True, page_id, self.num_columns_total)
             for col in range(self.num_columns_total):
                 off = pages[col].write(full[col])
@@ -364,7 +350,7 @@ class Table:
     # -------------------------
     def overwrite_base_indirection(self, base_rid: int, new_tail_rid: int) -> None:
         with self._meta_lock:
-            loc = self.page_directory[int(base_rid)] 
+            loc = self.page_directory[int(base_rid)]
             if loc.is_tail:
                 raise ValueError("base_rid points to tail")
             pr = self.page_ranges[loc.page_range_id]
@@ -376,7 +362,7 @@ class Table:
     def overwrite_base_schema(self, base_rid: int, new_schema: int) -> None:
         with self._meta_lock:
             loc = self.page_directory[int(base_rid)]
-            if loc.is_tail: 
+            if loc.is_tail:
                 raise ValueError("base_rid points to tail")
             pr = self.page_ranges[loc.page_range_id]
         with pr._lock:
@@ -401,12 +387,6 @@ class Table:
     def all_base_rids(self) -> List[int]:
         with self._meta_lock:
             return list(self._base_rid_list)
-            # rids = []
-            # for rid, loc in self.page_directory.items():
-            #     if not loc.is_tail:
-            #         rids.append(int(rid))
-            # # rids.sort()
-            # return rids
 
     def _read_physical_column(self, rid: int, col: int) -> int:
         with self._meta_lock:
@@ -441,12 +421,10 @@ class Table:
             if bool(self._deleted.get(br, False)):
                 raise KeyError("record deleted")
 
-            # Fast path: cache hit (most common after first access or after update)
             cached = self._latest_cache.get(br)
             if cached is not None:
                 return list(cached)
 
-        # Slow path: traverse tail chain
         base_full = self.read_physical_record(br)
         pr_id = self._base_page_range_id(br)
         tps = self.get_tps(pr_id)
@@ -454,11 +432,15 @@ class Table:
 
         latest = [int(base_full[HIDDEN_COLS + i]) for i in range(self.num_columns)]
         if ind == 0:
-            self._latest_cache[br] = list(latest)
+            with self._meta_lock:
+                if not bool(self._deleted.get(br, False)):
+                    self._latest_cache[br] = list(latest)
             return latest
 
         if tps != 0 and ind >= tps:
-            self._latest_cache[br] = list(latest)
+            with self._meta_lock:
+                if not bool(self._deleted.get(br, False)):
+                    self._latest_cache[br] = list(latest)
             return latest
 
         cur = ind
@@ -477,6 +459,7 @@ class Table:
                         latest[i] = int(tail_full[HIDDEN_COLS + i])
                         seen_mask |= bit
             cur = int(tail_full[INDIRECTION_COLUMN])
+
         with self._meta_lock:
             if not bool(self._deleted.get(br, False)):
                 self._latest_cache[br] = list(latest)
@@ -561,16 +544,15 @@ class Table:
         base_schema = self._base_schema(base_rid)
         self.overwrite_base_schema(base_rid, base_schema | schema)
 
-        # Update cache immediately so next read is O(1)
         new_latest = list(prev_latest)
         for i, v in enumerate(new_user_cols):
             if v is not None:
                 new_latest[i] = int(v)
+
         with self._meta_lock:
             if not bool(self._deleted.get(int(base_rid), False)):
                 self._latest_cache[int(base_rid)] = new_latest
 
-        # Trigger merge only when threshold reached
         pr_id = self._base_page_range_id(base_rid)
         with self._meta_lock:
             pr = self.page_ranges[pr_id]
@@ -589,7 +571,7 @@ class Table:
         return int(tail_rid)
 
     # =========================================================
-    # Snapshot helpers (鍚庡彴 merge 涓撶敤锛氱洿璇荤鐩橈紝涓?pin/unpin)
+    # Snapshot helpers（后台 merge 专用：直接读磁盘，不 pin / unpin）
     # =========================================================
     def _snapshot_get_page(self, pid, snap_cache: Dict) -> Page:
         p = snap_cache.get(pid)
@@ -599,10 +581,8 @@ class Table:
         if self.buffer_pool is None:
             raise RuntimeError("snapshot disk read requires buffer_pool")
 
-        # 鉁?鐩磋纾佺洏 bytes锛屼笉璧?page_table锛屼笉 pin
         raw = self.buffer_pool.read_page_bytes(pid)
 
-        # pid: base=(name, pr, False, ver, col, page_id)  tail=(name, pr, True, col, page_id)
         if isinstance(pid, tuple) and len(pid) >= 5:
             is_tail = bool(pid[2])
             col = int(pid[-2])
@@ -622,8 +602,8 @@ class Table:
             if loc is None:
                 raise KeyError("RID not found")
             pr_id = int(loc.page_range_id)
-        out = [0] * self.num_columns_total
 
+        out = [0] * self.num_columns_total
         for col in range(self.num_columns_total):
             if loc.is_tail:
                 pid = (self.name, pr_id, True, int(col), int(loc.page_id))
@@ -633,7 +613,7 @@ class Table:
             out[col] = page.read(int(loc.offset))
 
         return out
-    
+
     # -------------------------
     # Merge helpers (snapshot path)
     # -------------------------
@@ -676,20 +656,20 @@ class Table:
         lm = getattr(self, "lock_manager", None)
         if lm is None:
             return False
-    
+
         checker = getattr(lm, "has_x_lock", None)
         if checker is None:
             return False
-    
+
         rid_res = ("RID", self.name, int(base_rid))
         pk_res = None
-    
+
         try:
             latest = self.read_latest_user_columns(int(base_rid))
             pk_res = ("PK", self.name, int(latest[self.key]))
         except Exception:
             pk_res = None
-    
+
         try:
             if checker(rid_res):
                 return True
@@ -710,13 +690,12 @@ class Table:
     ) -> None:
         page_range_id = int(page_range_id)
         base_ver_snapshot = int(base_ver_snapshot)
-        tps_snapshot = int(tps_snapshot) # 鐩墠涓嶅己渚濊禆锛屼絾淇濈暀鎺ュ彛浠ヤ究浣犲仛瑁佸壀
+        tps_snapshot = int(tps_snapshot)
 
-        snap_cache: Dict = {}  # pid -> Page (private snapshot cache)
+        snap_cache: Dict = {}
         merged_values: Dict[int, List[int]] = {}
         new_tps = 0
 
-        # decreasing tail rids: TPS boundary = min(snapshot_indirection)
         for br, ind in snapshot_indirections.items():
             ind = int(ind)
             if ind != 0:
@@ -749,8 +728,6 @@ class Table:
     def request_merge(self, page_range_id: int) -> None:
         page_range_id = int(page_range_id)
 
-        # If DB was not opened(), buffer_pool is None (pure in-memory mode).
-        # In that mode, background merge that reads from disk is not applicable.
         if self.buffer_pool is None:
             return
 
@@ -794,9 +771,9 @@ class Table:
                 if bool(self._deleted.get(int(rid), False)):
                     continue
             snapshot[int(rid)] = ind
+
         if blocked:
             return
-
         if not snapshot:
             return
         if all(int(v) == 0 for v in snapshot.values()):
@@ -812,7 +789,7 @@ class Table:
         th.start()
 
     # -------------------------
-    # Apply merge (椤电骇鐭攣 + 鍙戝竷鐭攣)
+    # Apply merge
     # -------------------------
     def apply_merge_if_ready(self, page_range_id: int) -> None:
         page_range_id = int(page_range_id)
@@ -835,7 +812,6 @@ class Table:
             old_ver = int(pr.base_version)
             new_ver = int(res.new_version)
 
-            # 1) clone old base pages -> new version pages
             num_pages_per_col = [len(pr.base_pages[col]) for col in range(pr.num_columns_total)]
             with pr._lock:
                 for col in range(pr.num_columns_total):
@@ -856,7 +832,6 @@ class Table:
                         pr.base_version = new_ver
                         pr.release_page(False, col, page_id, dirty=True)
 
-            # 2) batch writes
             writes: Dict[Tuple[int, int], List[Tuple[int, int]]] = {}
             for br, vals in res.merged_values.items():
                 loc = self.page_directory.get(int(br))
@@ -868,7 +843,6 @@ class Table:
                     col_idx = HIDDEN_COLS + i
                     writes.setdefault((int(col_idx), int(pid)), []).append((off, int(v)))
 
-            # 3) apply merged values on new version
             with pr._lock:
                 for (col_idx, pid), pairs in writes.items():
                     pr.base_version = new_ver
@@ -877,7 +851,6 @@ class Table:
                         page.overwrite(int(off), int(v))
                     pr.release_page(False, int(col_idx), int(pid), dirty=True)
 
-            # 4) publish swap + TPS
             pr.base_version = new_ver
             pr.tps = int(res.new_tps)
 
@@ -980,7 +953,6 @@ class Table:
         from lstore.index import Index
         t.index = Index(t)
 
-        # restore safe defaults
         t._tail_update_count = {}
         t._last_merge_tail_pages = {}
 
