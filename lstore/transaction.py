@@ -113,6 +113,11 @@ class Transaction:
             pk = int(args[self.table.key])
             with self._meta_guard():
                 predicted_rid = int(getattr(self.table, "_next_base_rid", 0))
+        
+            # 在记录真正写入前先锁住将要使用的 base_rid
+            if self.lm is not None:
+                self.lm.acquire_X(self.txn_id, int(predicted_rid))
+        
             row = [int(x) for x in args]
             indexed = [(c, int(row[c])) for c in range(self.table.num_columns) if self.table.index.is_indexed(c)]
             old_existing = self.table.key2rid.get(pk)
@@ -347,15 +352,9 @@ class Transaction:
             
                 # INSERT 要在执行后，拿到真实 rid，再决定是否入栈
                 if undo is not None and undo.typ == "INSERT":
-                    pk = int(undo.payload["pk"])
-                    old_existing = undo.payload.get("old_existing", None)
-                    real_rid = self.table.key2rid.get(pk)
-                
-                    # 只有当这次事务真的发布了一个新的 rid，才把 INSERT undo 入栈
-                    if real_rid is not None and real_rid != old_existing:
-                        undo.base_rid = int(real_rid)
-                        self._undo.append(undo)
-                        self.lm.acquire_X(self.txn_id, int(real_rid))
+                    # INSERT 的 rid 已经在 _capture_before_write 里预锁，
+                    # 这里直接登记 undo 即可
+                    self._undo.append(undo)
                 
                 if not ok:
                     return self.abort()
