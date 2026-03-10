@@ -352,7 +352,7 @@ class Transaction:
                         self._undo.append(undo)
                 
                         self.lm.acquire_X(self.txn_id, int(real_rid))
-                            
+                
                 if not ok:
                     return self.abort()
             
