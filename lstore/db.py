@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Dict, Optional
 import json
 import threading
+import shutil
 
 from lstore.table import Table
 from lstore.bufferpool import BufferPool
@@ -142,8 +143,10 @@ class Database:
     # ------------------------------------------------------------------
     def create_table(self, name: str, num_columns: int, key_index: int) -> Table:
         with self._lock:
+            existing = self.tables.get(name)
+            if existing is not None:
+                return existing
             if self.bp is None:
-                # Open wasn't called; still allow table creation (in-memory)
                 table = Table(name, num_columns, key_index, buffer_pool=None)
             else:
                 table = Table(name, num_columns, key_index, buffer_pool=self.bp)
@@ -154,6 +157,9 @@ class Database:
         with self._lock:
             if name in self.tables:
                 del self.tables[name]
+            if self.path is not None:
+                table_dir = Path(self.path) / "pages" / str(name)
+                shutil.rmtree(table_dir, ignore_errors=True)
 
     def get_table(self, name: str) -> Optional[Table]:
         with self._lock:
