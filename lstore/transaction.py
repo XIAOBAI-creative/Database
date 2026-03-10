@@ -64,9 +64,8 @@ class Transaction:
     ) -> Tuple[List[Hashable], List[Hashable]]:
         name = getattr(op, "__name__", "")
 
-        # safest M3 policy:
-        # use a table-wide lock to protect shared structures like
-        # key2rid, index, latest_cache, page_directory, etc.
+        # coarse but safe for M3 hidden tests:
+        # protect shared structures like key2rid/index/latest_cache/page_directory
         table_res = ("TABLE_ALL", table.name)
 
         if name == "insert":
@@ -122,7 +121,7 @@ class Transaction:
             with self._meta_guard(table):
                 predicted_rid = int(getattr(table, "_next_base_rid", 0))
 
-            # pre-lock the predicted base RID before publish
+            # pre-lock predicted RID so publish/rollback is serialized
             lm = getattr(table, "lock_manager", None)
             if lm is not None:
                 lm.acquire_X(self.txn_id, int(predicted_rid))
@@ -212,7 +211,6 @@ class Transaction:
 
             try:
                 with self._meta_guard(t):
-                    # aborted insert should disappear rather than remain as a tombstone
                     t._deleted.pop(base_rid, None)
                     t._latest_cache.pop(base_rid, None)
 
@@ -288,7 +286,6 @@ class Transaction:
             except Exception:
                 pass
 
-            # remove the tail record we created so abort gets closer to the exact initial state
             if new_tail != 0:
                 try:
                     with self._meta_guard(t):
@@ -333,7 +330,7 @@ class Transaction:
         self._undo.clear()
 
         try:
-            # Phase 1: collect all lock requirements from all queries
+            # Phase 1: collect all lock requirements
             all_read: List[Tuple[LockManager, Hashable]] = []
             all_write: List[Tuple[LockManager, Hashable]] = []
 
@@ -350,26 +347,26 @@ class Transaction:
                 for r in write_res:
                     all_write.append((lm, r))
 
-            # remove S locks that are also requested as X on the same lock manager/resource
+            # remove S locks that are also requested as X
             write_set = {(id(lm), r) for (lm, r) in all_write}
             filtered_read: List[Tuple[LockManager, Hashable]] = []
             for (lm, r) in all_read:
                 if (id(lm), r) not in write_set:
                     filtered_read.append((lm, r))
 
-            # Acquire X first, then S
+            # strict 2PL: grab all locks first
             for (lm, r) in all_write:
                 lm.acquire_X(self.txn_id, r)
             for (lm, r) in filtered_read:
                 lm.acquire_S(self.txn_id, r)
 
-            # Phase 2: execute all queries
+            # Phase 2: execute
             for (op, table, args) in self.queries:
                 undo = None
 
                 if self._is_write_op(op):
                     undo = self._capture_before_write(table, op, args)
-                    if undo is not None and undo.typ != "INSERT":
+                    if undo is not None:
                         self._undo.append(undo)
 
                 op_name = getattr(op, "__name__", "")
@@ -383,15 +380,12 @@ class Transaction:
                 if not ok:
                     return self.abort()
 
+                # for successful insert, refresh undo rid to actual published rid
                 if undo is not None and undo.typ == "INSERT":
                     pk = int(undo.payload["pk"])
-                    old_existing = undo.payload.get("old_existing", None)
                     real_rid = table.key2rid.get(pk)
-
-                    # Only record INSERT undo if this insert actually published a new record
-                    if real_rid is not None and real_rid != old_existing:
+                    if real_rid is not None:
                         undo.base_rid = int(real_rid)
-                        self._undo.append(undo)
 
                 if undo is not None:
                     self._finalize_after_write(op, undo)
