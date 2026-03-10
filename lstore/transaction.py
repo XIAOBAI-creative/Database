@@ -3,8 +3,6 @@ from dataclasses import dataclass
 from typing import Any, Callable, List, Optional, Tuple, Dict, Hashable
 from contextlib import nullcontext
 import threading
-import time
-import random
 
 from lstore.table import Table
 from lstore.lock_manager import LockManager, LockConflict
@@ -62,29 +60,25 @@ class Transaction:
         self, table: Table, op: Callable[..., Any], args: Tuple[Any, ...]
     ) -> Tuple[List[Hashable], List[Hashable]]:
         name = getattr(op, "__name__", "")
-        table_res = ("TABLE_ALL", table.name)
 
         if name == "insert":
             if len(args) <= table.key:
-                return ([], [table_res])
+                return ([], [])
             pk = int(args[table.key])
-            return ([], [table_res, ("PK", table.name, pk)])
+            return ([], [("PK", table.name, pk)])
 
         if name in ("update", "delete", "increment"):
             if len(args) < 1:
-                return ([], [table_res])
+                return ([], [])
             pk = int(args[0])
-            write_locks: List[Hashable] = [table_res, ("PK", table.name, pk)]
-            base_rid = table.key2rid.get(pk)
+            write_locks: List[Hashable] = [("PK", table.name, pk)]
+            base_rid = table.get_base_rid_by_key(pk)
             if base_rid is not None:
                 write_locks.append(("RID", table.name, int(base_rid)))
             return ([], write_locks)
 
-        if name == "select":
-            return ([table_res], [])
-
-        if name == "sum":
-            return ([table_res], [])
+        if name in ("select", "sum"):
+            return ([], [])
 
         return ([], [])
 
@@ -320,34 +314,16 @@ class Transaction:
         if not self.queries:
             return True
 
-        attempts = 0
-        while True:
-            try:
-                ok = self._run_once()
-                if ok:
-                    return True
-
-                # 只有锁冲突才重试
-                if self._last_abort_reason == "LOCK":
-                    attempts += 1
-                    max_wait = min(0.002 * (2 ** attempts), 0.05)
-                    time.sleep(random.uniform(0.0005, max_wait))
-                    continue
-
-                return False
-
-            except LockConflict:
-                self._last_abort_reason = "LOCK"
-                self.abort()
-                attempts += 1
-                max_wait = min(0.002 * (2 ** attempts), 0.05)
-                time.sleep(random.uniform(0.0005, max_wait))
-                continue
-
-            except Exception:
-                self._last_abort_reason = "EXCEPTION"
-                self.abort()
-                return False
+        try:
+            return bool(self._run_once())
+        except LockConflict:
+            self._last_abort_reason = "LOCK"
+            self.abort()
+            return False
+        except Exception:
+            self._last_abort_reason = "EXCEPTION"
+            self.abort()
+            return False
 
     def abort(self) -> bool:
         try:
