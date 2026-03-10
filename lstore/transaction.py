@@ -292,7 +292,7 @@ class Transaction:
                     self._undo.append(undo)
 
             op_name = getattr(op, "__name__", "")
-            if op_name in ("select", "sum"):
+            if op_name in ("select", "sum", "increment"):
                 result = op(*args, txn=self)
             else:
                 result = op(*args)
