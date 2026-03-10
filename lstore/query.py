@@ -17,14 +17,18 @@ class Query:
         self._key_col = table.key
 
     def _acquire_shared_if_needed(self, txn, rid: int) -> bool:
-        """Try to grab a shared lock for reads. If we can't get it, there's a conflict."""
+        """Try to grab a shared lock for reads on this table. If we can't get it, there's a conflict."""
         if txn is None:
             return True
         try:
-            lm = getattr(txn, "lm", None)
             txn_id = getattr(txn, "txn_id", None)
-            if lm is None or txn_id is None:
+            if txn_id is None:
                 return True
+
+            lm = getattr(self.table, "lock_manager", None)
+            if lm is None:
+                return True
+
             lm.acquire_S(int(txn_id), int(rid))
             return True
         except LockConflict:
@@ -44,7 +48,7 @@ class Query:
             base_rid = int(base_rid)
             if self.table.is_deleted_rid(base_rid):
                 return False
-            
+
             # grab old values first -- we need them to remove index entries
             old_row = self.table.read_latest_user_columns(base_rid)
 
@@ -69,26 +73,26 @@ class Query:
         try:
             if len(columns) != self._num_cols:
                 return False
-    
+
             # NULLs not allowed on insert
             if any(v is None for v in columns):
                 return False
-    
+
             row = [int(x) for x in columns]
-    
+
             pk = int(row[self._key_col])
             existing = self.table.key2rid.get(pk)
             if existing is not None and not self.table.is_deleted_rid(int(existing)):
                 return False
-    
+
             base_rid = self.table.alloc_base_rid()
             self.table.write_base_record(base_rid, row)
-    
+
             # register in every index that exists
             for c in range(self._num_cols):
                 if self.table.index.is_indexed(c):
                     self.table.index.insert_entry(c, int(row[c]), int(base_rid))
-    
+
             return True
         except Exception:
             return False
@@ -104,30 +108,29 @@ class Query:
             search_col = int(column)
             search_val = int(key)
 
-
             # If running inside a transaction and the search column is NOT the primary key,
             # we avoid using the secondary index to prevent reading uncommitted updates.
             use_index = (
                 txn is None and
                 self.table.index.is_indexed(search_col)
             )
-            
+
             if use_index:
                 rids = self.table.index.locate(search_col, search_val)
             else:
                 rids = []
                 for rid in self.table.all_base_rids():
                     rid = int(rid)
-            
+
                     if self.table.is_deleted_rid(rid):
                         continue
-            
+
                     # acquire S lock when in a transaction
                     if not self._acquire_shared_if_needed(txn, rid):
                         return False
-            
+
                     v = self.table.read_latest_user_value(rid, search_col)
-            
+
                     if int(v) == search_val:
                         rids.append(rid)
 
@@ -214,7 +217,7 @@ class Query:
                 txn is None and
                 self.table.index.is_indexed(self._key_col)
             )
-            
+
             if use_index:
                 rids = self.table.index.locate_range(start_k, end_k, self._key_col)
                 for rid in rids:
