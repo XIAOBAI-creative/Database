@@ -252,7 +252,10 @@ class Index:
             for base_rid in self.table.all_base_rids():
                 if self.table.is_deleted_rid(base_rid):
                     continue
-                val = self.table.read_latest_user_value(base_rid, col)
+                if col == self.table.key:
+                    val = self.table.read_base_user_value(base_rid, col)
+                else:
+                    val = self.table.read_latest_user_value(base_rid, col)
                 if val is None:
                     continue
                 tree.insert(int(val), int(base_rid))
