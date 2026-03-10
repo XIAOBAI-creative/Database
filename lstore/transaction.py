@@ -155,6 +155,8 @@ class Transaction:
 
         if undo.typ == "INSERT":
             base_rid = int(undo.base_rid)
+            if base_rid < 0:
+                return
             row = [int(v) for v in undo.payload.get("row", [])]
             if not row:
                 return
