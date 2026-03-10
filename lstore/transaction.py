@@ -107,10 +107,11 @@ class Transaction:
                 predicted_rid = int(getattr(self.table, "_next_base_rid", 0))
             row = [int(x) for x in args]
             indexed = [(c, int(row[c])) for c in range(self.table.num_columns) if self.table.index.is_indexed(c)]
+            old_existing = self.table.key2rid.get(pk)
             return UndoEntry(
                 typ="INSERT",
                 base_rid=predicted_rid,
-                payload={"pk": pk, "indexed": indexed},
+                payload={"pk": pk, "indexed": indexed, "old_existing": old_existing},
             )
 
         if name in ("update", "increment"):
@@ -324,27 +325,33 @@ class Transaction:
                 undo = None
                 if self._is_write_op(op):
                     undo = self._capture_before_write(op, args)
-                    if undo is not None:
+                    # INSERT 不能提前按 predicted_rid 入栈
+                    if undo is not None and undo.typ != "INSERT":
                         self._undo.append(undo)
-
+            
                 op_name = getattr(op, "__name__", "")
                 if op_name in ("select", "sum"):
                     result = op(*args, txn=self)
                 else:
                     result = op(*args)
-
+            
                 ok = (result is not False)
-                if not ok:
-                    return self.abort()
-
-                # After a successful insert, lock the real base_rid
+            
+                # INSERT 要在执行后，拿到真实 rid，再决定是否入栈
                 if undo is not None and undo.typ == "INSERT":
                     pk = int(undo.payload["pk"])
+                    old_existing = undo.payload.get("old_existing", None)
                     real_rid = self.table.key2rid.get(pk)
-                    if real_rid is not None:
+                
+                    # 只有当这次事务真的发布了一个新的 rid，才把 INSERT undo 入栈
+                    if real_rid is not None and real_rid != old_existing:
                         undo.base_rid = int(real_rid)
                         self.lm.acquire_X(self.txn_id, int(real_rid))
-
+                        self._undo.append(undo)
+                            
+                if not ok:
+                    return self.abort()
+            
                 if undo is not None:
                     self._finalize_after_write(op, undo)
 
