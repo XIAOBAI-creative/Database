@@ -64,7 +64,9 @@ class Transaction:
     ) -> Tuple[List[Hashable], List[Hashable]]:
         name = getattr(op, "__name__", "")
 
-        # safest M3 policy: table-level lock to protect shared structures
+        # safest M3 policy:
+        # use a table-wide lock to protect shared structures like
+        # key2rid, index, latest_cache, page_directory, etc.
         table_res = ("TABLE_ALL", table.name)
 
         if name == "insert":
@@ -210,6 +212,7 @@ class Transaction:
 
             try:
                 with self._meta_guard(t):
+                    # aborted insert should disappear rather than remain as a tombstone
                     t._deleted.pop(base_rid, None)
                     t._latest_cache.pop(base_rid, None)
 
@@ -285,6 +288,7 @@ class Transaction:
             except Exception:
                 pass
 
+            # remove the tail record we created so abort gets closer to the exact initial state
             if new_tail != 0:
                 try:
                     with self._meta_guard(t):
@@ -328,25 +332,17 @@ class Transaction:
 
         self._undo.clear()
 
-        # collect all lock managers touched by this transaction
-        lock_managers: List[LockManager] = []
-        seen_lms = set()
-        for (_, table, _) in self.queries:
-            lm = getattr(table, "lock_manager", None)
-            if lm is None:
-                setattr(table, "lock_manager", LockManager())
-                lm = getattr(table, "lock_manager")
-            if id(lm) not in seen_lms:
-                seen_lms.add(id(lm))
-                lock_managers.append(lm)
-
         try:
-            # Phase 1: Collect ALL lock requirements from ALL queries
+            # Phase 1: collect all lock requirements from all queries
             all_read: List[Tuple[LockManager, Hashable]] = []
             all_write: List[Tuple[LockManager, Hashable]] = []
 
             for (op, table, args) in self.queries:
-                lm = getattr(table, "lock_manager")
+                lm = getattr(table, "lock_manager", None)
+                if lm is None:
+                    setattr(table, "lock_manager", LockManager())
+                    lm = getattr(table, "lock_manager")
+
                 read_res, write_res = self._plan_locks(table, op, args)
 
                 for r in read_res:
@@ -356,7 +352,7 @@ class Transaction:
 
             # remove S locks that are also requested as X on the same lock manager/resource
             write_set = {(id(lm), r) for (lm, r) in all_write}
-            filtered_read = []
+            filtered_read: List[Tuple[LockManager, Hashable]] = []
             for (lm, r) in all_read:
                 if (id(lm), r) not in write_set:
                     filtered_read.append((lm, r))
@@ -367,7 +363,7 @@ class Transaction:
             for (lm, r) in filtered_read:
                 lm.acquire_S(self.txn_id, r)
 
-            # Phase 2: Execute all queries
+            # Phase 2: execute all queries
             for (op, table, args) in self.queries:
                 undo = None
 
