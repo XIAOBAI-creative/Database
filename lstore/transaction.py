@@ -380,11 +380,18 @@ class Transaction:
 
                 ok = (result is not False)
 
-                if undo is not None and undo.typ == "INSERT":
-                    self._undo.append(undo)
-
                 if not ok:
                     return self.abort()
+
+                if undo is not None and undo.typ == "INSERT":
+                    pk = int(undo.payload["pk"])
+                    old_existing = undo.payload.get("old_existing", None)
+                    real_rid = table.key2rid.get(pk)
+
+                    # Only record INSERT undo if this insert actually published a new record
+                    if real_rid is not None and real_rid != old_existing:
+                        undo.base_rid = int(real_rid)
+                        self._undo.append(undo)
 
                 if undo is not None:
                     self._finalize_after_write(op, undo)
