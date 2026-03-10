@@ -429,17 +429,16 @@ class Query:
         except Exception:
             return 0
 
-    def increment(self, key: int, column: int) -> bool:
+    def increment(self, key: int, column: int, txn=None) -> bool:
         try:
-            recs = self.select(int(key), self._key_col, [1] * self._num_cols)
+            recs = self.select(int(key), self._key_col, [1] * self._num_cols, txn=txn)
             if not recs:
                 return False
-
+    
             curr = recs[0].columns
             updated = [None] * self._num_cols
             updated[int(column)] = int(curr[int(column)]) + 1
-
+    
             return bool(self.update(int(key), *updated))
-
         except Exception:
             return False
