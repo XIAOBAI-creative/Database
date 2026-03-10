@@ -676,11 +676,28 @@ class Table:
         lm = getattr(self, "lock_manager", None)
         if lm is None:
             return False
+    
         checker = getattr(lm, "has_x_lock", None)
         if checker is None:
             return False
+    
+        rid_res = ("RID", self.name, int(base_rid))
+        pk_res = None
+    
         try:
-            return bool(checker(int(base_rid)))
+            latest = self.read_latest_user_columns(int(base_rid))
+            pk_res = ("PK", self.name, int(latest[self.key]))
+        except Exception:
+            pk_res = None
+    
+        try:
+            if checker(rid_res):
+                return True
+            if pk_res is not None and checker(pk_res):
+                return True
+            if checker(("TABLE_ALL", self.name)):
+                return True
+            return False
         except Exception:
             return False
 
