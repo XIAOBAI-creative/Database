@@ -3,6 +3,8 @@ from dataclasses import dataclass
 from typing import Any, Callable, List, Optional, Tuple, Dict, Hashable
 from contextlib import nullcontext
 import threading
+import time
+import random
 
 from lstore.table import Table
 from lstore.lock_manager import LockManager, LockConflict
@@ -35,6 +37,7 @@ class Transaction:
         self.table: Optional[Table] = None
         self.lm: Optional[LockManager] = None
         self._undo: List[UndoEntry] = []
+        self._last_abort_reason: Optional[str] = None  # "LOCK" | "QUERY_FAIL" | "EXCEPTION"
 
     def add_query(self, query: Callable[..., Any], table: Table, *args) -> None:
         if not hasattr(table, "lock_manager") or getattr(table, "lock_manager") is None:
@@ -261,64 +264,90 @@ class Transaction:
                         pass
             return
 
+    def _run_once(self) -> bool:
+        self._undo.clear()
+        self._last_abort_reason = None
+
+        all_read: List[Tuple[LockManager, Hashable]] = []
+        all_write: List[Tuple[LockManager, Hashable]] = []
+
+        for (op, table, args) in self.queries:
+            lm = getattr(table, "lock_manager", None)
+            if lm is None:
+                setattr(table, "lock_manager", LockManager())
+                lm = getattr(table, "lock_manager")
+
+            read_res, write_res = self._plan_locks(table, op, args)
+            for r in read_res:
+                all_read.append((lm, r))
+            for r in write_res:
+                all_write.append((lm, r))
+
+        write_keys = {(id(lm), r) for (lm, r) in all_write}
+        filtered_read = [(lm, r) for (lm, r) in all_read if (id(lm), r) not in write_keys]
+
+        for (lm, r) in all_write:
+            lm.acquire_X(self.txn_id, r)
+        for (lm, r) in filtered_read:
+            lm.acquire_S(self.txn_id, r)
+
+        for (op, table, args) in self.queries:
+            undo = None
+            if self._is_write_op(op):
+                undo = self._capture_before_write(table, op, args)
+                if undo is not None:
+                    self._undo.append(undo)
+
+            op_name = getattr(op, "__name__", "")
+            if op_name in ("select", "sum"):
+                result = op(*args, txn=self)
+            else:
+                result = op(*args)
+
+            if result is False:
+                self._last_abort_reason = "QUERY_FAIL"
+                return self.abort()
+
+            if undo is not None and undo.typ == "INSERT":
+                pk = int(undo.payload["pk"])
+                real_rid = table.key2rid.get(pk)
+                if real_rid is not None:
+                    undo.base_rid = int(real_rid)
+
+        return self.commit()
+
     def run(self) -> bool:
         if not self.queries:
             return True
 
-        self._undo.clear()
+        attempts = 0
+        while True:
+            try:
+                ok = self._run_once()
+                if ok:
+                    return True
 
-        try:
-            all_read: List[Tuple[LockManager, Hashable]] = []
-            all_write: List[Tuple[LockManager, Hashable]] = []
+                # 只有锁冲突才重试
+                if self._last_abort_reason == "LOCK":
+                    attempts += 1
+                    max_wait = min(0.002 * (2 ** attempts), 0.05)
+                    time.sleep(random.uniform(0.0005, max_wait))
+                    continue
 
-            for (op, table, args) in self.queries:
-                lm = getattr(table, "lock_manager", None)
-                if lm is None:
-                    setattr(table, "lock_manager", LockManager())
-                    lm = getattr(table, "lock_manager")
+                return False
 
-                read_res, write_res = self._plan_locks(table, op, args)
-                for r in read_res:
-                    all_read.append((lm, r))
-                for r in write_res:
-                    all_write.append((lm, r))
+            except LockConflict:
+                self._last_abort_reason = "LOCK"
+                self.abort()
+                attempts += 1
+                max_wait = min(0.002 * (2 ** attempts), 0.05)
+                time.sleep(random.uniform(0.0005, max_wait))
+                continue
 
-            write_keys = {(id(lm), r) for (lm, r) in all_write}
-            filtered_read = [(lm, r) for (lm, r) in all_read if (id(lm), r) not in write_keys]
-
-            for (lm, r) in all_write:
-                lm.acquire_X(self.txn_id, r)
-            for (lm, r) in filtered_read:
-                lm.acquire_S(self.txn_id, r)
-
-            for (op, table, args) in self.queries:
-                undo = None
-                if self._is_write_op(op):
-                    undo = self._capture_before_write(table, op, args)
-                    if undo is not None:
-                        self._undo.append(undo)
-
-                op_name = getattr(op, "__name__", "")
-                if op_name in ("select", "sum"):
-                    result = op(*args, txn=self)
-                else:
-                    result = op(*args)
-
-                if result is False:
-                    return self.abort()
-
-                if undo is not None and undo.typ == "INSERT":
-                    pk = int(undo.payload["pk"])
-                    real_rid = table.key2rid.get(pk)
-                    if real_rid is not None:
-                        undo.base_rid = int(real_rid)
-
-            return self.commit()
-
-        except LockConflict:
-            return self.abort()
-        except Exception:
-            return self.abort()
+            except Exception:
+                self._last_abort_reason = "EXCEPTION"
+                self.abort()
+                return False
 
     def abort(self) -> bool:
         try:
