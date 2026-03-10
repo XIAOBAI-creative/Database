@@ -92,13 +92,11 @@ class Transaction:
                 return None
             row = [int(x) for x in args]
             pk = int(row[table.key])
-            with self._meta_guard(table):
-                predicted_rid = int(getattr(table, "_next_base_rid", 0))
             old_existing = table.key2rid.get(pk)
             return UndoEntry(
                 typ="INSERT",
                 table=table,
-                base_rid=predicted_rid,
+                base_rid=-1,   # 先不要猜，成功后再回填真实 rid
                 payload={
                     "pk": pk,
                     "row": row,
@@ -304,9 +302,11 @@ class Transaction:
 
             if undo is not None and undo.typ == "INSERT":
                 pk = int(undo.payload["pk"])
-                real_rid = table.key2rid.get(pk)
-                if real_rid is not None:
-                    undo.base_rid = int(real_rid)
+                real_rid = table.get_base_rid_by_key(pk)
+                if real_rid is None:
+                    self._last_abort_reason = "QUERY_FAIL"
+                    return self.abort()
+                undo.base_rid = int(real_rid)
 
         return self.commit()
 
