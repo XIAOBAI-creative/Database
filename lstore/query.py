@@ -7,46 +7,17 @@ from lstore.lock_manager import LockConflict
 class Query:
     """
     Entry point for all database operations -- insert, delete, update, select, etc.
+
     In Milestone 3:
-      - write locks are managed by Transaction
-      - read locks are acquired here on actual accessed RID(s)
-      - strict 2PL / no-wait conflicts must raise LockConflict in txn path
+      - transaction path: locks are managed at transaction level by Transaction
+      - standalone path: no extra locking is performed here
+      - strict 2PL / no-wait conflicts must propagate in txn path
     """
 
     def __init__(self, table: Table):
         self.table = table
         self._num_cols = table.num_columns
         self._key_col = table.key
-
-    def _acquire_shared_if_needed(self, txn, rid: int) -> bool:
-        if txn is None:
-            return True
-
-        txn_id = getattr(txn, "txn_id", None)
-        if txn_id is None:
-            return True
-
-        lm = getattr(self.table, "lock_manager", None)
-        if lm is None:
-            return True
-
-        lm.acquire_S(int(txn_id), ("RID", self.table.name, int(rid)))
-        return True
-
-    def _acquire_insert_rid_x_if_needed(self, txn, rid: int) -> bool:
-        if txn is None:
-            return True
-
-        txn_id = getattr(txn, "txn_id", None)
-        if txn_id is None:
-            return True
-
-        lm = getattr(self.table, "lock_manager", None)
-        if lm is None:
-            return True
-
-        lm.acquire_X(int(txn_id), ("RID", self.table.name, int(rid)))
-        return True
 
     def _rollback_insert_local(
         self,
@@ -74,8 +45,11 @@ class Query:
                 pass
 
         for c in range(self._num_cols):
-            if self.table.index.is_indexed(c):
-                self.table.index.delete_entry(c, int(row[c]), int(base_rid))
+            try:
+                if self.table.index.is_indexed(c):
+                    self.table.index.delete_entry(c, int(row[c]), int(base_rid))
+            except Exception:
+                pass
 
     def _rollback_delete_local(self, base_rid: int, old_row: List[int], old_deleted: bool) -> None:
         pk = int(old_row[self._key_col])
@@ -90,8 +64,11 @@ class Query:
 
         if not old_deleted:
             for c in range(self._num_cols):
-                if self.table.index.is_indexed(c):
-                    self.table.index.insert_entry(c, int(old_row[c]), int(base_rid))
+                try:
+                    if self.table.index.is_indexed(c):
+                        self.table.index.insert_entry(c, int(old_row[c]), int(base_rid))
+                except Exception:
+                    pass
 
     def _rollback_update_local(
         self,
@@ -101,10 +78,20 @@ class Query:
         old_schema: int,
         new_row: Optional[List[int]] = None,
     ) -> None:
-        new_tail = int(self.table._base_latest_tail_rid(base_rid))
+        try:
+            new_tail = int(self.table._base_latest_tail_rid(base_rid))
+        except Exception:
+            new_tail = 0
 
-        self.table.overwrite_base_indirection(base_rid, int(old_indirection))
-        self.table.overwrite_base_schema(base_rid, int(old_schema))
+        try:
+            self.table.overwrite_base_indirection(base_rid, int(old_indirection))
+        except Exception:
+            pass
+
+        try:
+            self.table.overwrite_base_schema(base_rid, int(old_schema))
+        except Exception:
+            pass
 
         if new_tail != 0 and new_tail != int(old_indirection):
             with self.table._meta_lock:
@@ -118,12 +105,15 @@ class Query:
 
         if new_row is not None:
             for c in range(self._num_cols):
-                if self.table.index.is_indexed(c):
-                    old_v = int(old_row[c])
-                    new_v = int(new_row[c])
-                    if old_v != new_v:
-                        self.table.index.delete_entry(c, new_v, int(base_rid))
-                        self.table.index.insert_entry(c, old_v, int(base_rid))
+                try:
+                    if self.table.index.is_indexed(c):
+                        old_v = int(old_row[c])
+                        new_v = int(new_row[c])
+                        if old_v != new_v:
+                            self.table.index.delete_entry(c, new_v, int(base_rid))
+                            self.table.index.insert_entry(c, old_v, int(base_rid))
+                except Exception:
+                    pass
 
     def delete(self, primary_key: int, txn=None) -> bool:
         try:
@@ -152,10 +142,11 @@ class Query:
         except LockConflict:
             raise
         except Exception:
-            if txn is not None:
-                raise
-            if "base_rid" in locals() and "old_row" in locals():
-                self._rollback_delete_local(int(base_rid), list(old_row), bool(old_deleted))
+            try:
+                if "base_rid" in locals() and "old_row" in locals():
+                    self._rollback_delete_local(int(base_rid), list(old_row), bool(old_deleted))
+            except Exception:
+                pass
             return False
 
     def insert(self, *columns, txn=None):
@@ -175,7 +166,6 @@ class Query:
                 return False
 
             base_rid = self.table.alloc_base_rid()
-            self._acquire_insert_rid_x_if_needed(txn, int(base_rid))
             self.table.write_base_record(base_rid, row)
 
             for c in range(self._num_cols):
@@ -189,14 +179,15 @@ class Query:
         except LockConflict:
             raise
         except Exception:
-            if txn is not None:
-                raise
-            if "base_rid" in locals() and "row" in locals():
-                self._rollback_insert_local(
-                    int(base_rid),
-                    list(row),
-                    old_existing if "old_existing" in locals() else None,
-                )
+            try:
+                if "base_rid" in locals() and "row" in locals():
+                    self._rollback_insert_local(
+                        int(base_rid),
+                        list(row),
+                        old_existing if "old_existing" in locals() else None,
+                    )
+            except Exception:
+                pass
             return False
 
     def select(self, key: int, column: int, query_columns: List[int], txn=None):
@@ -213,7 +204,6 @@ class Query:
             out: List[Record] = []
             for rid in rids:
                 rid = int(rid)
-                self._acquire_shared_if_needed(txn, rid)
 
                 if self.table.is_deleted_rid(rid):
                     continue
@@ -236,7 +226,7 @@ class Query:
             raise
         except Exception:
             if txn is not None:
-                raise
+                return False
             return []
 
     def update(self, key: int, *columns, txn=None) -> bool:
@@ -271,16 +261,17 @@ class Query:
         except LockConflict:
             raise
         except Exception:
-            if txn is not None:
-                raise
-            if "base_rid" in locals() and "old_row" in locals():
-                self._rollback_update_local(
-                    int(base_rid),
-                    [int(v) for v in old_row],
-                    int(old_indirection) if "old_indirection" in locals() else 0,
-                    int(old_schema) if "old_schema" in locals() else 0,
-                    new_row if "new_row" in locals() else None,
-                )
+            try:
+                if "base_rid" in locals() and "old_row" in locals():
+                    self._rollback_update_local(
+                        int(base_rid),
+                        [int(v) for v in old_row],
+                        int(old_indirection) if "old_indirection" in locals() else 0,
+                        int(old_schema) if "old_schema" in locals() else 0,
+                        new_row if "new_row" in locals() else None,
+                    )
+            except Exception:
+                pass
             return False
 
     def sum(self, start_range: int, end_range: int, aggregate_column_index: int, txn=None):
@@ -302,7 +293,6 @@ class Query:
 
             for rid in rids:
                 rid = int(rid)
-                self._acquire_shared_if_needed(txn, rid)
 
                 if self.table.is_deleted_rid(rid):
                     continue
@@ -318,7 +308,7 @@ class Query:
             raise
         except Exception:
             if txn is not None:
-                raise
+                return False
             return 0
 
     def select_version(self, key: int, column: int, query_columns: List[int], relative_version: int):
