@@ -171,10 +171,7 @@ class Transaction:
 
             for c in range(t.num_columns):
                 if t.index.is_indexed(c):
-                    try:
-                        t.index.delete_entry(c, int(row[c]), int(base_rid))
-                    except Exception:
-                        pass
+                    t.index.delete_entry(c, int(row[c]), int(base_rid))
             return
 
         if undo.typ == "DELETE":
@@ -197,10 +194,7 @@ class Transaction:
             if not old_deleted:
                 for c in range(t.num_columns):
                     if t.index.is_indexed(c):
-                        try:
-                            t.index.insert_entry(c, int(old_row[c]), int(base_rid))
-                        except Exception:
-                            pass
+                        t.index.insert_entry(c, int(old_row[c]), int(base_rid))
             return
 
         if undo.typ == "UPDATE":
@@ -211,15 +205,8 @@ class Transaction:
             if not old_row:
                 return
 
-            try:
-                new_row = t.read_latest_user_columns(base_rid)
-            except Exception:
-                new_row = None
-
-            try:
-                new_tail = int(t._base_latest_tail_rid(base_rid))
-            except Exception:
-                new_tail = 0
+            new_row = t.read_latest_user_columns(base_rid)
+            new_tail = int(t._base_latest_tail_rid(base_rid))
 
             t.overwrite_base_indirection(base_rid, old_indirection)
             t.overwrite_base_schema(base_rid, old_schema)
@@ -234,20 +221,66 @@ class Transaction:
                 if not bool(t._deleted.get(base_rid, False)):
                     t._latest_cache[base_rid] = list(old_row)
 
-            if new_row is not None:
-                for c in range(t.num_columns):
-                    if t.index.is_indexed(c):
-                        try:
-                            old_v = int(old_row[c])
-                            new_v = int(new_row[c])
-                            if old_v != new_v:
-                                t.index.delete_entry(c, new_v, int(base_rid))
-                                t.index.insert_entry(c, old_v, int(base_rid))
-                        except Exception:
-                            pass
+            for c in range(t.num_columns):
+                if t.index.is_indexed(c):
+                    old_v = int(old_row[c])
+                    new_v = int(new_row[c])
+                    if old_v != new_v:
+                        t.index.delete_entry(c, new_v, int(base_rid))
+                        t.index.insert_entry(c, old_v, int(base_rid))
             return
 
         raise ValueError(f"Unknown undo type: {undo.typ}")
+
+    def _get_matching_rids_for_select(self, table: Table, args: Tuple[Any, ...]) -> List[int]:
+        if len(args) < 2:
+            return []
+
+        search_val = int(args[0])
+        search_col = int(args[1])
+
+        if table.index.is_indexed(search_col):
+            rids = table.index.locate(search_col, search_val)
+            return [int(r) for r in rids]
+
+        matched = []
+        for rid in table.all_base_rids():
+            rid = int(rid)
+            if table.is_deleted_rid(rid):
+                continue
+            try:
+                latest = table.read_latest_user_columns(rid)
+            except Exception:
+                continue
+            if int(latest[search_col]) == search_val:
+                matched.append(rid)
+        return matched
+
+    def _get_matching_rids_for_sum(self, table: Table, args: Tuple[Any, ...]) -> List[int]:
+        if len(args) < 3:
+            return []
+
+        start_k = int(args[0])
+        end_k = int(args[1])
+        if start_k > end_k:
+            start_k, end_k = end_k, start_k
+
+        if table.index.is_indexed(table.key):
+            rids = table.index.locate_range(start_k, end_k, table.key)
+            return [int(r) for r in rids]
+
+        matched = []
+        for rid in table.all_base_rids():
+            rid = int(rid)
+            if table.is_deleted_rid(rid):
+                continue
+            try:
+                pk = int(table.read_latest_user_value(rid, table.key))
+            except Exception:
+                continue
+            if start_k <= pk <= end_k:
+                matched.append(rid)
+        return matched
 
     def _acquire_read_locks_for_op(
         self,
@@ -260,7 +293,19 @@ class Transaction:
             setattr(table, "lock_manager", LockManager())
             lm = getattr(table, "lock_manager")
 
-        lm.acquire_S(self.txn_id, ("TABLE", table.name))
+        name = getattr(op, "__name__", "")
+
+        if name == "select":
+            lm.acquire_S(self.txn_id, ("TABLE", table.name))
+            for rid in self._get_matching_rids_for_select(table, args):
+                lm.acquire_S(self.txn_id, ("RID", table.name, int(rid)))
+            return
+
+        if name == "sum":
+            lm.acquire_S(self.txn_id, ("TABLE", table.name))
+            for rid in self._get_matching_rids_for_sum(table, args):
+                lm.acquire_S(self.txn_id, ("RID", table.name, int(rid)))
+            return
 
     def _acquire_write_locks_for_op(
         self,
@@ -288,6 +333,7 @@ class Transaction:
             if len(args) < 1:
                 return
             pk = int(args[0])
+
             lm.acquire_X(self.txn_id, ("PK", table.name, pk))
 
             base_rid = table.get_base_rid_by_key(pk)
@@ -365,8 +411,8 @@ class Transaction:
             self._last_abort_reason = "LOCK"
             self.abort()
             return False
-        except Exception as e:
-            self._last_abort_reason = f"EXCEPTION: {type(e).__name__}: {e}"
+        except Exception:
+            self._last_abort_reason = "EXCEPTION"
             self.abort()
             return False
 
