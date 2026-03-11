@@ -1,54 +1,39 @@
-from __future__ import annotations
-from typing import List, Optional
 import threading
-import time
 import random
+import time
 
 
 class TransactionWorker:
 
-    def __init__(self, transactions: Optional[List[object]] = None):
-        self.stats: List[bool] = []
-        self.transactions = list(transactions) if transactions is not None else []
-        self.result: int = 0
+    def __init__(self, transactions=None):
+        self.transactions = transactions or []
+        self.stats = []
+        self.result = 0
+        self.thread = None
 
-        self._thread: Optional[threading.Thread] = None
-        self._aborts: int = 0
-        self._commits: int = 0
+    def run(self):
+        self.thread = threading.Thread(target=self.__run)
+        self.thread.start()
 
-    def add_transaction(self, t) -> None:
-        self.transactions.append(t)
+    def join(self):
+        if self.thread:
+            self.thread.join()
 
-    def run(self) -> None:
-        self._thread = threading.Thread(target=self.__run, daemon=True)
-        self._thread.start()
+    def __run(self):
 
-    def join(self) -> None:
-        if self._thread is not None:
-            self._thread.join()
-
-    def __run(self) -> None:
         for txn in self.transactions:
-            attempts = 0
+
             while True:
-                ok = bool(txn.run())
-                if ok:
+
+                result = txn.run()
+
+                if result:
                     self.stats.append(True)
-                    self._commits += 1
                     break
-                else:
-                    self._aborts += 1
-                    attempts += 1
 
-                    reason = getattr(txn, "_last_abort_reason", None)
+                if txn._last_abort_reason != "LOCK":
+                    break
 
-                    # 只有锁冲突才重试，逻辑失败/异常不无限重试
-                    if reason != "LOCK":
-                        break
+                time.sleep(random.uniform(0.001, 0.05))
 
-                    # 控制在很小范围，避免 grader 超时
-                    capped = min(attempts, 6)
-                    upper = min(0.002 * (2 ** capped), 0.05)
-                    time.sleep(random.uniform(0.0005, upper))
-
-        self.result = len(list(filter(lambda x: x, self.stats)))
+        self.result = sum(self.stats)
