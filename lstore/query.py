@@ -234,7 +234,7 @@ class Query:
             raise
         except Exception:
             if txn is not None:
-                return False
+                raise
             return []
 
     def update(self, key: int, *columns, txn=None) -> bool:
@@ -316,7 +316,7 @@ class Query:
             raise
         except Exception:
             if txn is not None:
-                return False
+                raise
             return 0
 
     def select_version(self, key: int, column: int, query_columns: List[int], relative_version: int):
