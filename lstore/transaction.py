@@ -47,15 +47,21 @@ class Transaction:
 
         self.queries.append((query, table, args))
 
-    def _is_write_op(self, op: Callable[..., Any]) -> bool:
-        return getattr(op, "__name__", "") in ("insert", "update", "delete", "increment")
-
     def _meta_guard(self, table: Table):
         lock = getattr(table, "_meta_lock", None)
         if lock is None:
             return nullcontext()
         return lock
 
+    def _is_write_op(self, op: Callable[..., Any]) -> bool:
+        return getattr(op, "__name__", "") in ("insert", "update", "delete", "increment")
+
+    def _is_read_op(self, op: Callable[..., Any]) -> bool:
+        return getattr(op, "__name__", "") in ("select", "sum")
+
+    # =========================================================
+    # Undo capture
+    # =========================================================
     def _capture_before_write(
         self,
         table: Table,
@@ -135,6 +141,9 @@ class Transaction:
 
         return None
 
+    # =========================================================
+    # Undo apply
+    # =========================================================
     def _apply_undo(self, undo: UndoEntry) -> None:
         t = undo.table
 
@@ -151,7 +160,6 @@ class Transaction:
             old_existing = undo.payload.get("old_existing", None)
 
             with self._meta_guard(t):
-                # aborted insert 必须逻辑上不可见
                 t._deleted[base_rid] = True
                 t._latest_cache.pop(base_rid, None)
 
@@ -209,7 +217,6 @@ class Transaction:
             t.overwrite_base_indirection(base_rid, old_indirection)
             t.overwrite_base_schema(base_rid, old_schema)
 
-            # abort 后新 tail 必须作废并标 deleted
             if new_tail != 0 and new_tail != old_indirection:
                 with self._meta_guard(t):
                     t._deleted[int(new_tail)] = True
@@ -230,6 +237,82 @@ class Transaction:
             return
 
         raise ValueError(f"Unknown undo type: {undo.typ}")
+
+    # =========================================================
+    # Lock planning helpers
+    # =========================================================
+    def _get_matching_rids_for_select(self, table: Table, args: Tuple[Any, ...]) -> List[int]:
+        if len(args) < 2:
+            return []
+
+        search_val = int(args[0])
+        search_col = int(args[1])
+
+        if table.index.is_indexed(search_col):
+            rids = table.index.locate(search_col, search_val)
+            return [int(r) for r in rids]
+
+        matched = []
+        for rid in table.all_base_rids():
+            rid = int(rid)
+            if table.is_deleted_rid(rid):
+                continue
+            try:
+                latest = table.read_latest_user_columns(rid)
+            except Exception:
+                continue
+            if int(latest[search_col]) == search_val:
+                matched.append(rid)
+        return matched
+
+    def _get_matching_rids_for_sum(self, table: Table, args: Tuple[Any, ...]) -> List[int]:
+        if len(args) < 3:
+            return []
+
+        start_k = int(args[0])
+        end_k = int(args[1])
+        if start_k > end_k:
+            start_k, end_k = end_k, start_k
+
+        if table.index.is_indexed(table.key):
+            rids = table.index.locate_range(start_k, end_k, table.key)
+            return [int(r) for r in rids]
+
+        matched = []
+        for rid in table.all_base_rids():
+            rid = int(rid)
+            if table.is_deleted_rid(rid):
+                continue
+            try:
+                pk = int(table.read_latest_user_value(rid, table.key))
+            except Exception:
+                continue
+            if start_k <= pk <= end_k:
+                matched.append(rid)
+        return matched
+
+    def _acquire_read_locks_for_op(
+        self,
+        table: Table,
+        op: Callable[..., Any],
+        args: Tuple[Any, ...],
+    ) -> None:
+        lm = getattr(table, "lock_manager", None)
+        if lm is None:
+            setattr(table, "lock_manager", LockManager())
+            lm = getattr(table, "lock_manager")
+
+        name = getattr(op, "__name__", "")
+
+        if name == "select":
+            for rid in self._get_matching_rids_for_select(table, args):
+                lm.acquire_S(self.txn_id, ("RID", table.name, int(rid)))
+            return
+
+        if name == "sum":
+            for rid in self._get_matching_rids_for_sum(table, args):
+                lm.acquire_S(self.txn_id, ("RID", table.name, int(rid)))
+            return
 
     def _acquire_write_locks_for_op(
         self,
@@ -263,6 +346,16 @@ class Transaction:
                 lm.acquire_X(self.txn_id, ("RID", table.name, int(base_rid)))
             return
 
+    def _acquire_all_locks_for_transaction(self) -> None:
+        for (op, table, args) in self.queries:
+            if self._is_write_op(op):
+                self._acquire_write_locks_for_op(table, op, args)
+            elif self._is_read_op(op):
+                self._acquire_read_locks_for_op(table, op, args)
+
+    # =========================================================
+    # Retry / release
+    # =========================================================
     def reset_for_retry(self) -> None:
         self._undo.clear()
         self._last_abort_reason = None
@@ -275,14 +368,18 @@ class Transaction:
                 released.add(id(lm))
                 lm.release_all(self.txn_id)
 
+    # =========================================================
+    # Main run
+    # =========================================================
     def _run_once(self) -> bool:
         self._undo.clear()
         self._last_abort_reason = None
 
-        for (op, table, args) in self.queries:
-            if self._is_write_op(op):
-                self._acquire_write_locks_for_op(table, op, args)
+        # Phase 1: 先把整个 transaction 需要的锁全部拿完
+        self._acquire_all_locks_for_transaction()
 
+        # Phase 2: 锁全部成功后，才真正执行 query
+        for (op, table, args) in self.queries:
             undo = None
             if self._is_write_op(op):
                 undo = self._capture_before_write(table, op, args)
@@ -335,7 +432,6 @@ class Transaction:
     def abort(self) -> bool:
         try:
             for i in range(len(self._undo) - 1, -1, -1):
-                # 不再吞异常
                 self._apply_undo(self._undo[i])
         finally:
             self._release_all_locks()
