@@ -29,7 +29,6 @@ class TransactionWorker:
 
     def __run(self) -> None:
         for txn in self.transactions:
-            attempts = 0
             while True:
                 ok = bool(txn.run())
                 if ok:
@@ -38,11 +37,8 @@ class TransactionWorker:
                     break
                 else:
                     self._aborts += 1
-                    attempts += 1
-                    # FIX: Exponential backoff with cap to reduce livelock
-                    # 修复后
-                    capped = min(attempts, 6)  # 限制指数上限为6
-                    max_wait = min(0.002 * (2 ** capped), 0.05)
-                    time.sleep(random.uniform(0.0005, max_wait))
-
+    
+                    # 极小随机等待，避免 livelock
+                    time.sleep(random.uniform(0.0001, 0.001))
+    
         self.result = len(list(filter(lambda x: x, self.stats)))
