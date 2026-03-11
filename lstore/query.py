@@ -6,14 +6,11 @@ from lstore.lock_manager import LockConflict
 
 class Query:
     """
-    Entry point for all database operations.
-
-    Milestone 3 design:
-      - write locks are managed by Transaction
-      - read locks are acquired here on actually accessed RID(s)
-      - in txn mode, Query does NOT do local rollback; it raises and lets
-        Transaction.abort() handle atomic undo
-      - in non-txn mode, Query keeps local rollback as a safety net
+    数据库对外查询接口。
+    M3 中：
+    - 写锁主要由 Transaction 负责
+    - 读路径在这里对实际访问 RID 加 S 锁
+    - strict 2PL + no-wait 冲突时抛出 LockConflict
     """
 
     def __init__(self, table: Table):
@@ -36,9 +33,23 @@ class Query:
         lm.acquire_S(int(txn_id), ("RID", self.table.name, int(rid)))
         return True
 
+    def _acquire_insert_rid_x_if_needed(self, txn, rid: int) -> bool:
+        if txn is None:
+            return True
+
+        txn_id = getattr(txn, "txn_id", None)
+        if txn_id is None:
+            return True
+
+        lm = getattr(self.table, "lock_manager", None)
+        if lm is None:
+            return True
+
+        lm.acquire_X(int(txn_id), ("RID", self.table.name, int(rid)))
+        return True
+
     # -------------------------
     # statement-local rollback helpers
-    # only used for non-txn single-statement mode
     # -------------------------
 
     def _rollback_insert_local(
@@ -148,6 +159,7 @@ class Query:
                 return False
 
             base_rid = int(base_rid)
+
             old_row = self.table.read_latest_user_columns(base_rid)
             with self.table._meta_lock:
                 old_deleted = bool(self.table._deleted.get(base_rid, False))
@@ -167,8 +179,6 @@ class Query:
         except LockConflict:
             raise
         except Exception:
-            if txn is not None:
-                raise
             try:
                 if "base_rid" in locals() and "old_row" in locals():
                     self._rollback_delete_local(int(base_rid), list(old_row), bool(old_deleted))
@@ -180,7 +190,7 @@ class Query:
     # INSERT
     # -------------------------
 
-    def insert(self, *columns, txn=None) -> bool:
+    def insert(self, *columns, txn=None):
         try:
             if len(columns) != self._num_cols:
                 return False
@@ -197,19 +207,24 @@ class Query:
                 return False
 
             base_rid = self.table.alloc_base_rid()
+
+            # 关键修复：
+            # 事务插入路径里，先把新 RID 锁住，再把记录发布到 page_directory / index / key2rid
+            self._acquire_insert_rid_x_if_needed(txn, int(base_rid))
+
             self.table.write_base_record(base_rid, row)
 
             for c in range(self._num_cols):
                 if self.table.index.is_indexed(c):
                     self.table.index.insert_entry(c, int(row[c]), int(base_rid))
 
+            if txn is not None:
+                return (True, int(base_rid))
             return True
 
         except LockConflict:
             raise
         except Exception:
-            if txn is not None:
-                raise
             try:
                 if "base_rid" in locals() and "row" in locals():
                     self._rollback_insert_local(
@@ -235,27 +250,24 @@ class Query:
             if use_index:
                 rids = self.table.index.locate(search_col, search_val)
             else:
-                rids = []
-                for rid in self.table.all_base_rids():
-                    rid = int(rid)
-                    if self.table.is_deleted_rid(rid):
-                        continue
-
-                    self._acquire_shared_if_needed(txn, rid)
-
-                    v = self.table.read_latest_user_value(rid, search_col)
-                    if int(v) == search_val:
-                        rids.append(rid)
+                rids = self.table.all_base_rids()
 
             out: List[Record] = []
+
             for rid in rids:
                 rid = int(rid)
+
+                # 先加 S 锁，再判断 deleted / 读取内容
+                # 这样未提交 insert / update / delete 都不会被读到
+                self._acquire_shared_if_needed(txn, rid)
+
                 if self.table.is_deleted_rid(rid):
                     continue
 
-                self._acquire_shared_if_needed(txn, rid)
-
                 latest = self.table.read_latest_user_columns(rid)
+
+                if int(latest[search_col]) != search_val:
+                    continue
 
                 projected: List[Optional[int]] = [None] * self._num_cols
                 for i, take in enumerate(query_columns):
@@ -271,7 +283,7 @@ class Query:
             raise
         except Exception:
             if txn is not None:
-                raise
+                return False
             return []
 
     # -------------------------
@@ -311,8 +323,6 @@ class Query:
         except LockConflict:
             raise
         except Exception:
-            if txn is not None:
-                raise
             try:
                 if "base_rid" in locals() and "old_row" in locals():
                     self._rollback_update_local(
@@ -336,32 +346,26 @@ class Query:
             end_k = int(end_range)
             if start_k > end_k:
                 start_k, end_k = end_k, start_k
-            c = int(aggregate_column_index)
 
+            c = int(aggregate_column_index)
             total = 0
             record_found = False
+
             use_index = self.table.index.is_indexed(self._key_col)
 
             if use_index:
                 rids = self.table.index.locate_range(start_k, end_k, self._key_col)
-                for rid in rids:
-                    rid = int(rid)
-                    if self.table.is_deleted_rid(rid):
-                        continue
+            else:
+                rids = self.table.all_base_rids()
 
-                    self._acquire_shared_if_needed(txn, rid)
-
-                    total += int(self.table.read_latest_user_value(rid, c))
-                    record_found = True
-
-                return int(total) if record_found else False
-
-            for rid in self.table.all_base_rids():
+            for rid in rids:
                 rid = int(rid)
+
+                # 同样先拿 S 锁
+                self._acquire_shared_if_needed(txn, rid)
+
                 if self.table.is_deleted_rid(rid):
                     continue
-
-                self._acquire_shared_if_needed(txn, rid)
 
                 pk = int(self.table.read_latest_user_value(rid, self._key_col))
                 if start_k <= pk <= end_k:
@@ -374,7 +378,7 @@ class Query:
             raise
         except Exception:
             if txn is not None:
-                raise
+                return False
             return 0
 
     # -------------------------
@@ -390,21 +394,17 @@ class Query:
             if self.table.index.is_indexed(search_col):
                 rids = self.table.index.locate(search_col, search_val)
             else:
-                rids = []
-                for rid in self.table.all_base_rids():
-                    rid = int(rid)
-                    if self.table.is_deleted_rid(rid):
-                        continue
-                    v = self.table.read_latest_user_value(rid, search_col)
-                    if int(v) == search_val:
-                        rids.append(rid)
+                rids = self.table.all_base_rids()
 
             out: List[Record] = []
             for rid in rids:
                 rid = int(rid)
                 if self.table.is_deleted_rid(rid):
                     continue
+
                 versioned = self.table.read_relative_user_columns(rid, steps_back)
+                if int(versioned[search_col]) != search_val:
+                    continue
 
                 projected: List[Optional[int]] = [None] * self._num_cols
                 for i, take in enumerate(query_columns):
@@ -425,6 +425,7 @@ class Query:
             end_k = int(end_range)
             if start_k > end_k:
                 start_k, end_k = end_k, start_k
+
             c = int(aggregate_column_index)
             steps_back = abs(int(relative_version))
 
@@ -441,7 +442,6 @@ class Query:
                 if self.table.is_deleted_rid(rid):
                     continue
 
-                    # no txn path here, versioned read is outside M3 txn path
                 pk = int(self.table.read_latest_user_value(rid, self._key_col))
                 if start_k <= pk <= end_k:
                     total += int(self.table.read_relative_user_value(rid, c, steps_back))
@@ -471,6 +471,4 @@ class Query:
         except LockConflict:
             raise
         except Exception:
-            if txn is not None:
-                raise
             return False
