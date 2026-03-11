@@ -5,14 +5,7 @@ from lstore.lock_manager import LockConflict
 
 
 class Query:
-    """
-    Entry point for all database operations -- insert, delete, update, select, etc.
 
-    In Milestone 3:
-      - transaction path: locks are managed at transaction level by Transaction
-      - standalone path: no extra locking is performed here
-      - strict 2PL / no-wait conflicts must propagate in txn path
-    """
 
     def __init__(self, table: Table):
         self.table = table
