@@ -54,3 +54,4 @@ class TransactionWorker:
                         reset_fn()
 
         self.result = len(list(filter(lambda x: x, self.stats)))
+        
