@@ -8,26 +8,6 @@ class LockConflict(Exception):
 
 
 class LockManager:
-    """
-    Strict no-wait 2PL lock manager with simple table hierarchy awareness.
-
-    Supported resources:
-      ("TABLE", table_name)
-      ("PK", table_name, pk)
-      ("RID", table_name, rid)
-
-    Compatibility rules:
-      - same txn re-entrant acquire succeeds
-      - S conflicts with another txn's X on the same resource
-      - X conflicts with another txn's S/X on the same resource
-      - TABLE locks also conflict with row/key locks from other txns on the same table:
-          * TABLE-S conflicts with any row/key TABLE-X on same table by others
-          * TABLE-X conflicts with any lock on same table by others
-          * row/key-S conflicts with TABLE-X by others
-          * row/key-X conflicts with TABLE-S/TABLE-X by others
-      - no waiting: any conflict raises LockConflict immediately
-    """
-
     def __init__(self):
         self._lock = threading.RLock()
         self._shared_holders = defaultdict(set)   # resource -> {txn_id}
